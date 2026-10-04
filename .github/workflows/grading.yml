@@ -1,0 +1,124 @@
+# Auto-grader workflow for the PUBLIC starter repo.
+# Secret tests are fetched at runtime from the private repo Ce1lo/rest-api-grader
+# using the GRADER_PAT secret. See SETUP.md in the grader repo (team only).
+#
+# PR code runs only inside Docker without secrets or grader files.
+
+name: Auto grade assignment
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+
+    steps:
+      - name: Checkout student PR code (untrusted, for sandbox only)
+        run: |
+          mkdir -p submission
+          cd submission
+          git init
+          git remote add origin https://github.com/${{ github.event.pull_request.head.repo.full_name }}.git
+          git fetch --depth 1 origin ${{ github.event.pull_request.head.sha }}
+          git checkout FETCH_HEAD
+
+
+      - name: Build and run student submission in isolated container
+        env:
+          DB_NAME: grading_${{ github.event.pull_request.number }}
+        run: |
+          cat > submission/Dockerfile <<'EOF'
+          FROM node:22-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --ignore-scripts || npm install --ignore-scripts
+          COPY . .
+          USER node
+          EXPOSE 5000
+          CMD ["node", "server.js"]
+          EOF
+          docker build -t student-submission submission
+          rm -rf submission
+          docker run -d --name student-submission \
+            --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 --memory 512m \
+            --network host \
+            -e PORT=5000 \
+            -e MONGO_URI="mongodb://127.0.0.1:27017/$DB_NAME" \
+            student-submission
+
+          for i in $(seq 1 30); do
+            if curl -s -f http://127.0.0.1:5000/ > /dev/null; then
+              echo "Student server is ready on port 5000!"
+              break
+            fi
+            echo "Waiting for student server to start... ($i/30)"
+            sleep 1
+          done
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Fetch secret grader (trusted)
+        uses: actions/checkout@v4
+        with:
+          repository: Ce1lo/rest-api-grader
+          token: ${{ secrets.GRADER_PAT }}
+          path: .grader
+          persist-credentials: false
+
+      - name: Install grader dependencies
+        run: |
+          cd .grader
+          npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Run secret grader
+        env:
+          MONGO_URI: mongodb://127.0.0.1:27017/grading_${{ github.event.pull_request.number }}
+          BASE_URL: http://127.0.0.1:5000
+          GRADE_OUTPUT: ${{ github.workspace }}/grade_report.json
+          GRADE_SUMMARY: ${{ github.workspace }}/grade_summary.md
+        run: |
+          if ! node .grader/grader/run.js > "$RUNNER_TEMP/grader.log" 2>&1; then
+            echo 'He thong cham gap su co. Xem log noi bo cua nguoi quan ly.' > grade_summary.md
+            exit 1
+          fi
+
+      - name: Prepare email when grading did not start
+        if: always()
+        run: |
+          if [ ! -s grade_summary.md ]; then
+            echo 'He thong cham chua hoan tat. Kiem tra Actions cho PR nay.' > grade_summary.md
+          fi
+
+      - name: Stop isolated submission
+        if: always()
+        run: docker rm -f student-submission 2>/dev/null || true
+
+      - name: Email private result to owner
+        if: always()
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: lamtoan185@gmail.com
+          password: ${{ secrets.GRADER_MAIL_APP_PASSWORD }}
+          subject: 'Ket qua cham PR #${{ github.event.pull_request.number }}'
+          to: lamtoan185@gmail.com
+          from: lamtoan185@gmail.com
+          body: file://grade_summary.md
+          html_body: file://grade_summary.md
+          convert_markdown: true
